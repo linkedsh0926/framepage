@@ -1,0 +1,28 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    ports:
+      - "${FRAMEPAGE_PORT:-8000}:8000"
+    environment:
+      FRAMEPAGE_MODE: "${FRAMEPAGE_MODE:-demo}"
+      FRAMEPAGE_DATA_DIR: /data
+      FRAMEPAGE_DATABASE_PATH: /data/framepage.sqlite3
+      FRAMEPAGE_TOKEN_SECRET: "${FRAMEPAGE_TOKEN_SECRET:-framepage-local-compose-secret-change-me}"
+      FRAMEPAGE_CORS_ORIGINS: "${FRAMEPAGE_CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}"
+      FRAMEPAGE_MAX_VIDEO_SECONDS: "${FRAMEPAGE_MAX_VIDEO_SECONDS:-7200}"
+      FRAMEPAGE_MAX_DOWNLOAD_BYTES: "${FRAMEPAGE_MAX_DOWNLOAD_BYTES:-2147483648}"
+      FRAMEPAGE_ARTIFACT_TTL_HOURS: "${FRAMEPAGE_ARTIFACT_TTL_HOURS:-24}"
+      FRAMEPAGE_SIGNED_URL_SECONDS: "${FRAMEPAGE_SIGNED_URL_SECONDS:-300}"
+      FRAMEPAGE_MAX_REQUEST_BYTES: "${FRAMEPAGE_MAX_REQUEST_BYTES:-1048576}"
+      FRAMEPAGE_RATE_LIMIT: "${FRAMEPAGE_RATE_LIMIT:-180}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      OPENROUTER_BASE_URL: "${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}"
+    volumes:
+      - framepage_data:/data
+    restart: unless-stopped
+
+volumes:
+  framepage_data:

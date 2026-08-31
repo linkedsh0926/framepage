@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "framepage"
+version = "0.1.0"
+description = "Turn progressive YouTube presentations into readable PDFs"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.32,<1",
+  "pydantic>=2.10,<3",
+  "httpx>=0.28,<1",
+  "jinja2>=3.1,<4",
+  "Pillow>=11,<13",
+  "yt-dlp>=2025.1.15",
+  "opencv-python-headless>=4.10,<5",
+  "weasyprint>=63,<70",
+  "reportlab>=4.2,<5",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.3,<10", "pytest-asyncio>=0.25,<2", "pypdf>=5,<7"]
+production = ["celery[redis]>=5.4,<6", "psycopg[binary]>=3.2,<4", "boto3>=1.35,<2"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
