@@ -565,6 +565,10 @@ class Pipeline:
         """Run bounded VLM review and translate its whitelist action server-side."""
         self._start_stage(job_id, "reviewing_frames", 0.6)
         max_rounds = min(3, max(1, rounds))
+        span_ms = (pages[-1]["end_ms"] - pages[0]["start_ms"]) if pages else 0
+        # Roughly one page per three minutes keeps long narrated videos readable
+        # even when the visuals barely change.
+        min_pages = max(2, int(span_ms / 180_000))
         review_targets = list(pages)
         for round_number in range(1, max_rounds + 1):
             self._check_cancelled(job_id)
@@ -685,7 +689,7 @@ class Pipeline:
                     "confidence": decision.confidence,
                 })
                 changed = self._apply_review_action(
-                    decision.action, pages, index, source, workspace, resample_fps
+                    decision.action, pages, index, source, workspace, resample_fps, min_pages
                 )
                 if changed:
                     changed_count += 1
@@ -746,18 +750,22 @@ class Pipeline:
         previous = pages[index - 1]["paragraphs"][-1] if index > 0 and pages[index - 1]["paragraphs"] else ""
         following = pages[index + 1]["paragraphs"][0] if index + 1 < len(pages) and pages[index + 1]["paragraphs"] else ""
         prompt = (
-            "Judge whether the image is the stable final state after progressive content has fully "
-            "loaded and, together with its ASR, represents a relatively independent chapter. "
-            "The product requires ONE page per original PPT slide, not one page per animation step. "
-            "Compare all three images before deciding. If CURRENT and NEXT retain the same slide "
-            "background, heading, layout, or topic while NEXT adds or reveals any content, CURRENT "
-            "is an incomplete progressive state and you MUST choose merge_next, even when its narration "
-            "is substantive. Keep only the last, most complete state of that slide. Drop meaningless "
-            "transitions. Merge a true continuation or duplicate into the correct neighbor. For an "
-            "unstable capture use search_later, search_earlier, or resample_local. Never keep a frame "
-            "merely because it is sharp or visually stable for a few seconds. Drop non-content "
-            "splash screens, legal/investment disclaimers, subscribe prompts, and empty section "
-            "transitions unless the user would need that frame to understand the lecture. "
+            "Decide whether this frame deserves its own page in a lecture handout. "
+            "Compare PREVIOUS, CURRENT and NEXT before deciding. "
+            "Choose merge_next ONLY when CURRENT is genuinely an incomplete build-up of NEXT: "
+            "the same static document or slide progressively reveals content and NEXT strictly "
+            "contains everything CURRENT shows plus more. In that case keep only the final "
+            "complete state. "
+            "Do NOT merge merely because two frames share a background, layout, speaker or topic. "
+            "Talking-head videos, interviews, screencasts and live footage hold a nearly constant "
+            "frame for long stretches while the narration moves on; those segments are separate "
+            "chapters and must be kept even though the pictures look alike. "
+            "Keep a frame when its narration raises a new point, example or conclusion a reader "
+            "would want on its own page. "
+            "Drop meaningless transitions, splash screens, legal or investment disclaimers, "
+            "subscribe prompts and empty section cards unless a reader needs them. "
+            "For an unstable or mid-transition capture use search_later, search_earlier, or "
+            "resample_local. Never keep a frame merely because it is sharp. "
             "Return JSON only with "
             "action, reason, confidence. action must be one of keep, drop, merge_previous, "
             "merge_next, search_later, search_earlier, resample_local, low_confidence. "
@@ -969,8 +977,13 @@ class Pipeline:
         source: Path,
         workspace: Path,
         resample_fps: int,
+        min_pages: int = 1,
     ) -> bool:
         page = pages[index]
+        # Guard against the VLM collapsing a whole lecture into one page: once the
+        # selection reaches the floor, refuse any action that removes a page.
+        if action in {"drop", "merge_previous", "merge", "merge_next"} and len(pages) <= min_pages:
+            return False
         if action == "drop" and len(pages) > 1:
             pages.pop(index)
             return True
