@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
@@ -85,7 +87,38 @@ def _estimate(duration_seconds: int) -> dict[str, int]:
     }
 
 
-def inspect_video(value: str, settings: Settings) -> dict:
+
+def _describe_ytdlp_failure(stderr: str, returncode: int) -> str:
+    """Surface yt-dlp's real error instead of masking every failure as a private video."""
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    errors = [line for line in lines if line.startswith("ERROR:")]
+    if errors:
+        detail = errors[-1][len("ERROR:"):].strip()
+    elif lines:
+        detail = lines[-1]
+    else:
+        detail = ""
+    detail = re.sub(r"^\[[a-z0-9_-]+\]\s*[A-Za-z0-9_-]{11}:\s*", "", detail).strip()
+    if not detail:
+        detail = "yt-dlp exited with status " + str(returncode)
+    return "YouTube extraction failed: " + detail
+
+
+
+def write_cookie_file(cookies: str) -> str:
+    """Persist user supplied Netscape cookies to a temp file for yt-dlp."""
+    handle = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", suffix=".txt", prefix="framepage-cookies-", delete=False
+    )
+    try:
+        handle.write(cookies if cookies.endswith("\n") else cookies + "\n")
+    finally:
+        handle.close()
+    os.chmod(handle.name, 0o600)
+    return handle.name
+
+
+def inspect_video(value: str, settings: Settings, cookies: str | None = None) -> dict:
     ref = parse_youtube_url(value, allow_demo=settings.mode in {"demo", "test"})
     if settings.mode in {"demo", "test"}:
         duration = 12 * 60 + 34
@@ -105,24 +138,33 @@ def inspect_video(value: str, settings: Settings) -> dict:
     executable = shutil.which("yt-dlp")
     if not executable:
         raise VideoInspectionError("yt-dlp is unavailable on this server")
-    proc = subprocess.run(
-        [
-            executable,
-            "--dump-single-json",
-            "--skip-download",
-            "--no-playlist",
-            "--no-warnings",
-            ref.canonical_url,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=45,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise VideoInspectionError(
-            "The video is unavailable. Use a public video that does not require login."
+    command = [
+        executable,
+        "--dump-single-json",
+        "--skip-download",
+        "--no-playlist",
+        "--no-warnings",
+    ]
+    cookie_path = write_cookie_file(cookies) if cookies and cookies.strip() else None
+    if cookie_path:
+        command.extend(["--cookies", cookie_path])
+    command.append(ref.canonical_url)
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
         )
+    finally:
+        if cookie_path:
+            try:
+                os.unlink(cookie_path)
+            except OSError:
+                pass
+    if proc.returncode != 0:
+        raise VideoInspectionError(_describe_ytdlp_failure(proc.stderr, proc.returncode))
     try:
         metadata = json.loads(proc.stdout)
         duration = int(metadata.get("duration") or 0)

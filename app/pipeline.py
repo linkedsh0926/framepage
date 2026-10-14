@@ -4,6 +4,7 @@ import base64
 import hashlib
 import html
 import json
+import os
 import re
 import selectors
 import shutil
@@ -20,7 +21,7 @@ from .config import Settings
 from .db import Database
 from .schemas import ReviewDecision, VisionCorrection
 from .security import resolve_storage_key
-from .youtube import inspect_video, parse_youtube_url
+from .youtube import inspect_video, parse_youtube_url, write_cookie_file
 
 
 STAGES = (
@@ -244,7 +245,8 @@ class Pipeline:
             raise RuntimeError("real mode requires yt-dlp, ffmpeg, and ffprobe")
 
         ref = parse_youtube_url(request["youtube_url"])
-        metadata = inspect_video(ref.canonical_url, self.settings)
+        cookies = request.get("youtube_cookies") or None
+        metadata = inspect_video(ref.canonical_url, self.settings, cookies)
         if metadata["video"]["duration_seconds"] > self.settings.max_video_seconds:
             raise RuntimeError("video exceeds duration limit")
         duration_seconds = int(metadata["video"]["duration_seconds"])
@@ -255,6 +257,7 @@ class Pipeline:
             ref.canonical_url,
             workspace,
             downstream_eta=downstream_eta,
+            cookies=cookies,
         )
         if source.stat().st_size > self.settings.max_download_bytes:
             raise RuntimeError("video exceeds file size limit")
@@ -1106,8 +1109,10 @@ class Pipeline:
         workspace: Path,
         *,
         downstream_eta: int,
+        cookies: str | None = None,
     ) -> Path:
         template = str(workspace / "source.%(ext)s")
+        cookie_path = write_cookie_file(cookies) if cookies and cookies.strip() else None
         command = [
             shutil.which("yt-dlp") or "yt-dlp",
             "--no-playlist",
@@ -1130,8 +1135,10 @@ class Pipeline:
             "mp4",
             "-o",
             template,
-            canonical_url,
         ]
+        if cookie_path:
+            command.extend(["--cookies", cookie_path])
+        command.append(canonical_url)
         proc = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -1222,6 +1229,11 @@ class Pipeline:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=3)
+            if cookie_path:
+                try:
+                    os.unlink(cookie_path)
+                except OSError:
+                    pass
         if proc.returncode is None:
             proc.wait(timeout=5)
         if proc.returncode != 0:

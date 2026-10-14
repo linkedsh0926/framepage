@@ -11,6 +11,7 @@ class StrictModel(BaseModel):
 
 class InspectRequest(StrictModel):
     youtube_url: str = Field(min_length=1, max_length=2048)
+    youtube_cookies: str | None = Field(default=None, max_length=65536)
 
 
 class ProfileFields(StrictModel):
@@ -61,6 +62,7 @@ class DuplicateProfileRequest(StrictModel):
 
 class JobCreate(StrictModel):
     youtube_url: str = Field(min_length=1, max_length=2048)
+    youtube_cookies: str | None = Field(default=None, max_length=65536)
     profile_id: str = Field(default="profile_smart_default", min_length=1, max_length=80)
     profile_version: int = Field(default=1, ge=1)
     profile_overrides: dict[str, Any] = Field(default_factory=dict)

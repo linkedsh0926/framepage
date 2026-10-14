@@ -367,6 +367,57 @@
 
     .field-block { margin-top: 34px; }
 
+    .cookie-field { margin-top: 22px; }
+
+    .cookie-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 32px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--blue-dark);
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .cookie-toggle-icon {
+      display: inline-block;
+      width: 12px;
+      transition: transform 0.18s ease;
+    }
+
+    .cookie-toggle[aria-expanded="true"] .cookie-toggle-icon { transform: rotate(90deg); }
+
+    .cookie-panel { margin-top: 12px; }
+    .cookie-panel[hidden] { display: none; }
+
+    .cookie-input {
+      display: block;
+      width: 100%;
+      min-height: 104px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: var(--surface-soft);
+      color: var(--ink);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.65;
+      resize: vertical;
+    }
+
+    .cookie-input:focus {
+      outline: none;
+      border-color: var(--blue);
+      background: var(--surface);
+      box-shadow: 0 0 0 3px rgba(52, 87, 223, 0.14);
+    }
+
+    .cookie-status-active { color: var(--green); }
+
     .field-label {
       display: flex;
       align-items: baseline;
@@ -1377,6 +1428,16 @@
               <p class="field-error" id="url-error" role="alert"></p>
               <div class="input-tools" id="url-help"><span>支持 youtube.com、youtu.be 和 Shorts 链接</span><button class="link-button" id="sample-button" type="button">清空链接</button></div>
             </div>
+            <div class="field-block cookie-field">
+              <button class="cookie-toggle" id="cookie-toggle" type="button" aria-expanded="false" aria-controls="cookie-panel">
+                <span class="cookie-toggle-icon" aria-hidden="true">&#9656;</span><span>高级：YouTube Cookies（可选）</span>
+              </button>
+              <div class="cookie-panel" id="cookie-panel" hidden>
+                <label class="field-label" for="youtube-cookies"><span>Cookies 内容</span><span class="field-note" id="cookie-status">未设置</span></label>
+                <textarea id="youtube-cookies" class="cookie-input" rows="5" spellcheck="false" autocomplete="off" placeholder="# Netscape HTTP Cookie File&#10;.youtube.com&#9;TRUE&#9;/&#9;TRUE&#9;0&#9;VISITOR_INFO1_LIVE&#9;xxxx" aria-describedby="cookies-help"></textarea>
+                <div class="input-tools" id="cookies-help"><span>仅保存在本机浏览器，用于通过 YouTube 登录验证</span><button class="link-button" id="clear-cookies-button" type="button">清除 Cookies</button></div>
+              </div>
+            </div>
             <ul class="limit-list" aria-label="处理说明">
               <li class="limit-item"><strong>视频访问</strong><span>公开且无需登录</span></li>
               <li class="limit-item"><strong>讲解语言</strong><span>中文及中英混合</span></li>
@@ -1560,11 +1621,17 @@
     const API_ROOT = '/api/v1';
     const SESSION_JOB_KEY = 'framepage_job_id';
     const SESSION_TOKEN_KEY = 'framepage_access_token';
+    const COOKIES_STORAGE_KEY = 'framepage_youtube_cookies';
     const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
     const panels = Array.from(document.querySelectorAll('.step-panel'));
     const indicators = Array.from(document.querySelectorAll('.stepper-item'));
     const input = document.getElementById('youtube-url');
+    const cookieToggle = document.getElementById('cookie-toggle');
+    const cookiePanel = document.getElementById('cookie-panel');
+    const cookieInput = document.getElementById('youtube-cookies');
+    const cookieStatus = document.getElementById('cookie-status');
+    const clearCookiesButton = document.getElementById('clear-cookies-button');
     const urlControl = document.getElementById('url-control');
     const urlError = document.getElementById('url-error');
     const readButton = document.getElementById('read-video-button');
@@ -2150,7 +2217,7 @@
       try {
         const result = await apiRequest('/videos/inspect', {
           method: 'POST',
-          body: { youtube_url: input.value.trim() }
+          body: { youtube_url: input.value.trim(), youtube_cookies: cookiesValue() }
         });
         const video = result.data && result.data.video;
         if (!video || !video.video_id || !video.title) throw new ApiError('服务端返回的视频信息不完整，请稍后重试。', 500);
@@ -2816,6 +2883,7 @@
       const density = document.querySelector('input[name="density"]:checked');
       return {
         youtube_url: app.video.canonical_url || input.value.trim(),
+        youtube_cookies: cookiesValue(),
         profile_id: profile.id,
         profile_version: profile.version,
         profile_overrides: app.profileEdited ? currentSettings() : {},
@@ -3480,6 +3548,80 @@
     document.getElementById('dismiss-learning-button').addEventListener('click', function () {
       resolveLearning('本次建议已在当前页面忽略；没有向服务端提交任何 Profile 修改。');
     });
+    function readStoredCookies() {
+      try {
+        return window.localStorage.getItem(COOKIES_STORAGE_KEY) || '';
+      } catch (error) {
+        return '';
+      }
+    }
+
+    function cookiesValue() {
+      const value = cookieInput ? cookieInput.value.trim() : '';
+      return value || null;
+    }
+
+    function updateCookieStatus() {
+      if (!cookieInput || !cookieStatus) return;
+      const value = cookieInput.value.trim();
+      if (!value) {
+        cookieStatus.textContent = '未设置';
+        cookieStatus.classList.remove('cookie-status-active');
+        return;
+      }
+      const lines = value.split('\n').filter(function (line) {
+        return line.trim() && !line.trim().startsWith('#');
+      }).length;
+      cookieStatus.textContent = '已填写 ' + lines + ' 条';
+      cookieStatus.classList.add('cookie-status-active');
+    }
+
+    function persistCookies() {
+      if (!cookieInput) return;
+      const value = cookieInput.value.trim();
+      try {
+        if (value) {
+          window.localStorage.setItem(COOKIES_STORAGE_KEY, value);
+        } else {
+          window.localStorage.removeItem(COOKIES_STORAGE_KEY);
+        }
+      } catch (error) {
+        /* storage unavailable (private mode); cookies stay in memory only */
+      }
+      updateCookieStatus();
+    }
+
+    if (cookieToggle && cookiePanel) {
+      cookieToggle.addEventListener('click', function () {
+        const expanded = cookieToggle.getAttribute('aria-expanded') === 'true';
+        cookieToggle.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+        cookiePanel.hidden = expanded;
+      });
+    }
+
+    if (cookieInput) {
+      cookieInput.value = readStoredCookies();
+      updateCookieStatus();
+      if (cookieInput.value.trim() && cookieToggle && cookiePanel) {
+        cookieToggle.setAttribute('aria-expanded', 'true');
+        cookiePanel.hidden = false;
+      }
+      let cookieTimer = null;
+      cookieInput.addEventListener('input', function () {
+        if (cookieTimer) window.clearTimeout(cookieTimer);
+        cookieTimer = window.setTimeout(persistCookies, 400);
+        updateCookieStatus();
+      });
+      cookieInput.addEventListener('blur', persistCookies);
+    }
+
+    if (clearCookiesButton && cookieInput) {
+      clearCookiesButton.addEventListener('click', function () {
+        cookieInput.value = '';
+        persistCookies();
+      });
+    }
+
     downloadButton.addEventListener('click', downloadResult);
     document.getElementById('new-task-button').addEventListener('click', resetTask);
     document.getElementById('history-button').addEventListener('click', function () { resumeStoredJob(); });

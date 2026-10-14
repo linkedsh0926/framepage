@@ -245,7 +245,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.post("/api/v1/videos/inspect")
     async def inspect(request: Request, body: InspectRequest) -> dict[str, Any]:
         try:
-            result = await asyncio.to_thread(inspect_video, body.youtube_url, settings)
+            result = await asyncio.to_thread(
+                inspect_video, body.youtube_url, settings, body.youtube_cookies
+            )
         except InvalidYouTubeURL as exc:
             raise APIError(422, "invalid_youtube_url", str(exc)) from exc
         except VideoInspectionError as exc:

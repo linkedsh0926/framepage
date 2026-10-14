@@ -9,6 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         ffmpeg \
         fontconfig \
         fonts-noto-cjk \
@@ -20,13 +21,23 @@ RUN apt-get update \
         libpangoft2-1.0-0 \
         poppler-utils \
         shared-mime-info \
+        unzip \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+# Install deno JS runtime for yt-dlp YouTube extraction
+RUN curl -fsSL https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip -o /tmp/deno.zip \
+    && unzip /tmp/deno.zip -d /tmp \
+    && mv /tmp/deno /usr/local/bin/deno \
+    && chmod +x /usr/local/bin/deno \
+    && rm -f /tmp/deno.zip
+
+ WORKDIR /app
 
 COPY pyproject.toml ./
 COPY app ./app
-RUN python -m pip install .
+RUN python -m pip install --upgrade pip \
+    && python -m pip install . \
+    && python -m pip install --upgrade "yt-dlp[default]"
 
 COPY index.html ./index.html
 
@@ -38,7 +49,6 @@ RUN groupadd --gid 10001 framepage \
 USER framepage
 
 ENV FRAMEPAGE_DATA_DIR=/data
-
 EXPOSE 8000
 
 HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=5 \
