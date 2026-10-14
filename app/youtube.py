@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
@@ -105,13 +106,94 @@ def _describe_ytdlp_failure(stderr: str, returncode: int) -> str:
 
 
 
+_NETSCAPE_HEADER = "# Netscape HTTP Cookie File"
+_DEFAULT_COOKIE_DOMAIN = ".youtube.com"
+_DEFAULT_COOKIE_EXPIRY_DAYS = 365
+
+
+def _looks_like_netscape(text: str) -> bool:
+    """True when at least one non-comment line carries 7 cookie fields."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if len(stripped.split("\t")) == 7:
+            return True
+        fields = stripped.split()
+        if len(fields) == 7 and fields[3] in {"TRUE", "FALSE"}:
+            return True
+    return False
+
+
+def _parse_cookie_header(text: str) -> list[tuple[str, str]]:
+    """Extract name/value pairs from a raw `Cookie:` header."""
+    body = text.strip()
+    if body[:7].lower() == "cookie:":
+        body = body[7:]
+    pairs: list[tuple[str, str]] = []
+    for chunk in re.split(r"[;\n]", body):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        name, _, value = chunk.partition("=")
+        name = name.strip()
+        if name:
+            pairs.append((name, value.strip().strip('"')))
+    return pairs
+
+
+def _parse_cookie_json(text: str) -> list[tuple[str, str]]:
+    """Extract name/value pairs from a JSON array of cookie objects."""
+    data = json.loads(text)
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        items = data.get("cookies") or []
+    else:
+        items = []
+    pairs: list[tuple[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if name:
+            pairs.append((name, str(item.get("value") or "")))
+    return pairs
+
+
+def _as_netscape(pairs: list[tuple[str, str]]) -> str:
+    expiry = int(time.time()) + _DEFAULT_COOKIE_EXPIRY_DAYS * 86400
+    lines = [_NETSCAPE_HEADER]
+    for name, value in pairs:
+        secure = "TRUE" if name.startswith(("__Secure-", "__Host-")) else "FALSE"
+        lines.append("\t".join([_DEFAULT_COOKIE_DOMAIN, "TRUE", "/", secure, str(expiry), name, value]))
+    return "\n".join(lines) + "\n"
+
+
 def write_cookie_file(cookies: str) -> str:
-    """Persist user supplied Netscape cookies to a temp file for yt-dlp."""
+    """Persist user supplied cookies to a temp file for yt-dlp.
+
+    Accepts a Netscape cookie file verbatim, and converts a raw `Cookie:`
+    header or a JSON array into Netscape form so yt-dlp can consume it.
+    """
+    text = (cookies or "").strip()
+    if text and not _looks_like_netscape(text):
+        pairs: list[tuple[str, str]] = []
+        stripped = text.lstrip()
+        if stripped[:1] in {"[", "{"}:
+            try:
+                pairs = _parse_cookie_json(stripped)
+            except (ValueError, TypeError):
+                pairs = []
+        if not pairs:
+            pairs = _parse_cookie_header(text)
+        if pairs:
+            text = _as_netscape(pairs)
     handle = tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", suffix=".txt", prefix="framepage-cookies-", delete=False
     )
     try:
-        handle.write(cookies if cookies.endswith("\n") else cookies + "\n")
+        handle.write(text if text.endswith("\n") else text + "\n")
     finally:
         handle.close()
     os.chmod(handle.name, 0o600)
