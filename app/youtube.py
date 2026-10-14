@@ -107,24 +107,13 @@ def _describe_ytdlp_failure(stderr: str, returncode: int) -> str:
 
 
 _NETSCAPE_HEADER = "# Netscape HTTP Cookie File"
+# Every converted cookie is scoped to .youtube.com even though the browser
+# keeps Google account cookies under .google.com: yt-dlp only sends cookies
+# whose domain matches the host it is talking to, so anything scoped to
+# .google.com is dropped from youtube.com requests and the login state never
+# reaches YouTube's bot check.
 _DEFAULT_COOKIE_DOMAIN = ".youtube.com"
-_GOOGLE_AUTH_DOMAIN = ".google.com"
 _DEFAULT_COOKIE_EXPIRY_DAYS = 365
-
-# Google account cookies are scoped to .google.com; sending them under
-# .youtube.com makes yt-dlp drop them and the login state never reaches
-# YouTube's bot check.
-_GOOGLE_AUTH_COOKIES = frozenset({
-    "SID", "SIDCC", "HSID", "SSID", "APISID", "SAPISID", "OSID", "LSID",
-    "LOGIN_INFO", "NID", "ACCOUNT_CHOOSER", "SMSV", "OTZ",
-    "__Secure-1PSID", "__Secure-3PSID", "__Secure-1PAPISID", "__Secure-3PAPISID",
-    "__Secure-1PSIDCC", "__Secure-3PSIDCC", "__Secure-1PSIDTS", "__Secure-3PSIDTS",
-})
-
-
-def _cookie_domain(name: str) -> str:
-    """Pick the domain a cookie must carry for YouTube to accept it."""
-    return _GOOGLE_AUTH_DOMAIN if name in _GOOGLE_AUTH_COOKIES else _DEFAULT_COOKIE_DOMAIN
 
 
 def _looks_like_netscape(text: str) -> bool:
@@ -182,7 +171,7 @@ def _as_netscape(pairs: list[tuple[str, str]]) -> str:
     lines = [_NETSCAPE_HEADER]
     for name, value in pairs:
         secure = "TRUE" if name.startswith(("__Secure-", "__Host-")) else "FALSE"
-        lines.append("\t".join([_cookie_domain(name), "TRUE", "/", secure, str(expiry), name, value]))
+        lines.append("\t".join([_DEFAULT_COOKIE_DOMAIN, "TRUE", "/", secure, str(expiry), name, value]))
     return "\n".join(lines) + "\n"
 
 
