@@ -3388,7 +3388,11 @@
       setButtonBusy(downloadButton, true, '正在获取下载地址…');
       showInlineError(resultError, '');
       try {
-        if (!app.result || !app.result.download_url) await loadResult();
+        // The signed URL expires (default 5 min), so refresh it when it is
+        // missing or about to lapse instead of reusing a dead signature.
+        const expiresAt = app.result && app.result.expires_at ? Date.parse(app.result.expires_at) : 0;
+        const staleResult = !app.result || !app.result.download_url || !expiresAt || expiresAt - Date.now() < 30000;
+        if (staleResult) await loadResult();
         if (!app.result || !app.result.download_url) throw new ApiError('服务端没有返回可下载地址。', 500);
         const downloadUrl = safeAssetUrl(app.result.download_url);
         if (!downloadUrl) throw new ApiError('服务端返回的下载地址不安全或格式无效。', 500);
