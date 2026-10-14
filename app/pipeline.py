@@ -449,6 +449,7 @@ class Pipeline:
                 source,
                 workspace,
                 int(profile["local_resample_fps"]),
+                int(profile["stable_wait_ms"]),
             )
         else:
             self._review_demo(job_id, pages, min(int(profile["review_rounds"]), 3))
@@ -592,6 +593,7 @@ class Pipeline:
         source: Path,
         workspace: Path,
         resample_fps: int,
+        stable_wait_ms: int = 900,
     ) -> None:
         """Run bounded VLM review and translate its whitelist action server-side."""
         self._start_stage(job_id, "reviewing_frames", 0.6)
@@ -720,7 +722,8 @@ class Pipeline:
                     "confidence": decision.confidence,
                 })
                 changed = self._apply_review_action(
-                    decision.action, pages, index, source, workspace, resample_fps, min_pages
+                    decision.action, pages, index, source, workspace, resample_fps,
+                    min_pages, stable_wait_ms,
                 )
                 if changed:
                     changed_count += 1
@@ -1021,6 +1024,7 @@ class Pipeline:
         workspace: Path,
         resample_fps: int,
         min_pages: int = 1,
+        stable_wait_ms: int = 900,
     ) -> bool:
         page = pages[index]
         # Guard against the VLM collapsing a whole lecture into one page: once the
@@ -1060,7 +1064,7 @@ class Pipeline:
                 resample_fps,
             )
             selected_ms = self._select_stable_resampled_frame(
-                resampled, page["start_ms"], resample_fps
+                resampled, page["start_ms"], resample_fps, stable_wait_ms
             )
             if selected_ms is not None:
                 page["keyframe_ms"] = min(page["end_ms"] - 1, selected_ms)
@@ -1082,7 +1086,7 @@ class Pipeline:
 
     @staticmethod
     def _select_stable_resampled_frame(
-        video: Path, window_start_ms: int, fps: int
+        video: Path, window_start_ms: int, fps: int, stable_wait_ms: int = 900
     ) -> int | None:
         """Choose a sharp later frame after the last material local change."""
         try:
@@ -1114,7 +1118,10 @@ class Pipeline:
         capture.release()
         if not samples:
             return None
-        stable_wait_frames = max(1, round(actual_fps * 0.5))
+        # Replaces a hardcoded half second: the profile's stable_wait_ms now
+        # actually decides how long the picture must hold before a frame counts
+        # as the settled state.
+        stable_wait_frames = max(1, round(actual_fps * (max(100, stable_wait_ms) / 1000.0)))
         later_floor = round(len(samples) * 0.6)
         start_index = min(
             len(samples) - 1,

@@ -418,6 +418,18 @@
 
     .cookie-status-active { color: var(--green); }
 
+    .param-hint {
+      margin-left: 7px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: var(--surface-soft);
+      color: var(--muted-light);
+      font-size: 10px;
+      font-style: normal;
+      font-weight: 600;
+      vertical-align: 1px;
+    }
+
     .field-label {
       display: flex;
       align-items: baseline;
@@ -1468,7 +1480,7 @@
               <div class="profile-grid" id="profile-grid" role="radiogroup" aria-label="参数 Profile"></div>
               <div class="profile-detail" id="profile-detail">
                 <div class="profile-detail-row">
-                  <div class="profile-detail-copy"><strong id="profile-detail-title">智能默认</strong><span id="profile-detail-description">先分析当前视频的切页、稳定时长和渐进加载方式，再从通用参数开始。</span></div>
+                  <div class="profile-detail-copy"><strong id="profile-detail-title">智能默认</strong><span id="profile-detail-description">先分析当前视频的语音停顿、讲解话题与画面切页，再融合切分章节并套用通用参数。</span></div>
                   <button class="mini-button" id="advanced-toggle" type="button" aria-expanded="false" aria-controls="advanced-params">查看参数<svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
                 </div>
                 <div class="profile-chips" id="profile-chips" aria-label="Profile 摘要"></div>
@@ -1476,7 +1488,7 @@
               <div class="advanced-params" id="advanced-params" hidden>
                 <div class="advanced-head"><div><strong>候选与复核参数</strong><span>只影响关键帧识别，不影响 PDF 排版</span></div><button class="mini-button" id="save-as-profile-button" type="button">另存为 Profile</button></div>
                 <div class="param-grid">
-                  <label class="param-control"><span class="param-label"><span>变化敏感度</span><output id="sensitivity-output">0.42</output></span><input id="sensitivity-range" type="range" min="15" max="70" value="42" aria-label="变化敏感度"></label>
+                  <label class="param-control"><span class="param-label"><span>变化敏感度<em class="param-hint">相对阈值松紧</em></span><output id="sensitivity-output">0.55</output></span><input id="sensitivity-range" type="range" min="15" max="70" value="55" aria-label="变化敏感度"></label>
                   <label class="param-control"><span class="param-label"><span>稳定态等待</span><output id="stability-output">1.00s</output></span><input id="stability-range" type="range" min="2" max="10" value="4" aria-label="稳定态等待时间"></label>
                   <label class="param-control"><span class="param-label"><span>局部重采样上限</span></span><select id="resample-select" aria-label="局部重采样上限"><option value="8">8 fps</option><option value="10" selected>10 fps</option><option value="12">12 fps</option></select></label>
                   <label class="param-control"><span class="param-label"><span>语义复核上限</span></span><select id="rounds-select" aria-label="语义复核上限"><option value="2">2 轮</option><option value="3" selected>3 轮</option></select></label>
@@ -1529,9 +1541,9 @@
                 <div class="workbench-head"><strong id="pipeline-title">处理流水线</strong><span>自动执行</span></div>
                 <ol class="stage-list" id="stage-list">
                   <li class="stage-item" data-stage="0"><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">下载并标准化视频<span class="stage-detail">生成 360p / 4fps 分析视频</span></span><span class="stage-state">WAIT</span></li>
-                  <li class="stage-item" data-stage="1"><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">宽松提取候选帧<span class="stage-detail">多阈值找出切页与稳定态候选</span></span><span class="stage-state">WAIT</span></li>
-                  <li class="stage-item" data-stage="2"><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">识别并对齐讲解<span class="stage-detail">Qwen3-ASR-1.7B · 页面时间窗</span></span><span class="stage-state">WAIT</span></li>
-                  <li class="stage-item" data-stage="3"><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">语义复核与局部重采样<span class="stage-detail">丢弃过渡页，只在不确定区间迭代</span></span><span class="stage-state">WAIT</span></li>
+                  <li class="stage-item" data-stage="1"><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">多通道切分章节<span class="stage-detail">音频停顿 · 讲解话题 · 画面切换三路融合</span></span><span class="stage-state">WAIT</span></li>
+                  <li class="stage-item" data-stage="2"><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">转写全片讲解<span class="stage-detail">Qwen3-ASR-1.7B · 全片带时间戳</span></span><span class="stage-state">WAIT</span></li>
+                  <li class="stage-item" data-stage="3"><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">语义复核与局部重采样<span class="stage-detail">每视频自适应阈值，只在不确定区间迭代</span></span><span class="stage-state">WAIT</span></li>
                   <li class="stage-item" data-stage="4"><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">高清取帧与讲稿校订<span class="stage-detail">DeepSeek V4 Flash Vision Exp</span></span><span class="stage-state">WAIT</span></li>
                   <li class="stage-item" data-stage="5"><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">排版并生成 PDF<span class="stage-detail">A4 · 高清关键帧</span></span><span class="stage-state">WAIT</span></li>
                 </ol>
@@ -1547,7 +1559,7 @@
                 <div class="monitor-verdict"><span><i></i><b id="monitor-action">等待实时复核事件</b></span><span><i></i><b id="monitor-kept">尚无候选统计</b></span></div>
               </aside>
               <section class="review-loop" aria-labelledby="review-loop-title">
-                <div class="review-loop-head"><strong id="review-loop-title">语义复核迭代</strong><span id="review-limit">最多 3 轮</span></div>
+                <div class="review-loop-head"><strong id="review-loop-title">语义复核迭代</strong><span id="review-limit">最多 3 轮 · 收敛即停</span></div>
                 <div class="review-summary" id="review-summary" role="status" aria-live="polite" aria-atomic="true">等待候选帧与讲解对齐完成</div>
                 <ol class="review-round-list">
                   <li class="review-round" data-review-round="1"><span class="round-index"><span>1</span></span><span class="round-copy"><strong>第 1 轮</strong><span id="round-1-detail">等待检查页面完整性与章节独立性</span></span><em class="round-badge">WAIT</em></li>
@@ -1929,12 +1941,12 @@
         sourceProfileId: profile.source_profile_id || null,
         isDefault: isDefault,
         custom: !isDefault,
-        sensitivity: Number.isFinite(sensitivityValue) ? Math.round((sensitivityValue <= 1 ? sensitivityValue * 100 : sensitivityValue)) : 42,
+        sensitivity: Number.isFinite(sensitivityValue) ? Math.round((sensitivityValue <= 1 ? sensitivityValue * 100 : sensitivityValue)) : 55,
         stability: Number.isFinite(stableMs) ? Math.round(stableMs / 250) : 4,
         resample: Number(profile.local_resample_fps) || 10,
         rounds: Number(profile.review_rounds) || 3,
         description: String(profile.description || (isDefault
-          ? '系统安全默认参数；会根据当前视频执行受控的局部分析。'
+          ? '系统安全默认参数；会按当前视频的停顿、话题与画面自适应切分章节。'
           : '服务端保存的自定义关键帧识别参数。')),
         meta: isDefault ? 'SYSTEM · v' + (Number(profile.version) || 1) : 'v' + (Number(profile.version) || 1) + (profile.verified_video_count ? ' · 已验证 ' + profile.verified_video_count + ' 个视频' : '')
       };
