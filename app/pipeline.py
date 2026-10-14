@@ -302,12 +302,40 @@ class Pipeline:
                 "estimated_remaining_seconds": remaining,
             })
 
-        pages = self._opencv_candidates(
+        duration_ms = int(metadata["video"]["duration_seconds"] * 1000)
+        key = self.settings.openrouter_api_key
+        # Channel 1 - audio pauses, thresholded against this track's loudness.
+        audio_boundaries = self._silence_boundaries(audio, duration_ms)
+        # Channel 2 - one full transcript, then the model's topic boundaries.
+        transcript_segments: list[tuple[int, int, str]] = []
+        semantic_boundaries: list[int] = []
+        if key:
+            transcript_segments = self._full_transcript(audio, workspace, duration_ms, key)
+            semantic_boundaries = self._semantic_boundaries(transcript_segments, key)
+        # Channel 3 - visual cuts, scored against this video's own statistics.
+        visual_boundaries, peak_ratio = self._adaptive_visual_boundaries(
             analysis_video,
-            workspace,
-            int(metadata["video"]["duration_seconds"] * 1000),
             float(profile["change_sensitivity"]),
             on_progress=report_candidate_scan,
+        )
+        fused = self._fuse_boundaries(
+            visual_boundaries,
+            audio_boundaries,
+            semantic_boundaries,
+            duration_ms,
+            peak_ratio,
+        )
+        pages = self._build_pages_from_boundaries(
+            analysis_video,
+            fused,
+            duration_ms,
+            workspace,
+            {
+                "visual": len(visual_boundaries),
+                "audio": len(audio_boundaries),
+                "semantic": len(semantic_boundaries),
+                "peak_ratio": round(peak_ratio, 2),
+            },
         )
         hq_started = time.monotonic()
 
@@ -345,7 +373,6 @@ class Pipeline:
                 int(profile["local_resample_fps"]),
             )
         self._start_stage(job_id, "transcribing", 0.43)
-        key = self.settings.openrouter_api_key
         if key:
             chunk_total = sum(
                 len(self._audio_chunk_windows(int(page["start_ms"]), int(page["end_ms"])))
@@ -395,16 +422,20 @@ class Pipeline:
                     "estimated_remaining_seconds": max(1, eta),
                 })
 
-            for page in pages:
-                transcript, audit = self._transcribe_page(
-                    audio,
-                    workspace,
-                    page,
-                    key,
-                    on_chunk_complete=report_transcription_chunk,
-                )
-                page["paragraphs"] = [transcript] if transcript else ["本页没有可辨识的讲解。"]
-                page["audit"]["asr"] = audit
+            if transcript_segments:
+                self._attach_transcript(pages, transcript_segments)
+            else:
+                # The semantic channel came back empty; transcribe per page.
+                for page in pages:
+                    transcript, audit = self._transcribe_page(
+                        audio,
+                        workspace,
+                        page,
+                        key,
+                        on_chunk_complete=report_transcription_chunk,
+                    )
+                    page["paragraphs"] = [transcript] if transcript else ["本页没有可辨识的讲解。"]
+                    page["audit"]["asr"] = audit
         else:
             self._warning(job_id, "openrouter_unconfigured", "OPENROUTER_API_KEY is not configured; deterministic transcript cleanup was used.")
             for page in pages:
@@ -704,16 +735,28 @@ class Pipeline:
             for number, page in enumerate(pages, 1):
                 page["page_number"] = number
 
-            if not upstream_errors and changed_count == 0 and len(decisions) == len(round_targets):
-                self.db.add_event(job_id, "review_round_passed", {
-                    "round": round_number,
-                    "remaining_issue_count": 0,
-                })
-                self.db.add_event(job_id, "review_stopped", {
-                    "round": round_number,
-                    "condition": "stable_selection",
-                })
-                break
+            if not upstream_errors and len(decisions) == len(round_targets):
+                if changed_count == 0:
+                    self.db.add_event(job_id, "review_round_passed", {
+                        "round": round_number,
+                        "remaining_issue_count": 0,
+                    })
+                    self.db.add_event(job_id, "review_stopped", {
+                        "round": round_number,
+                        "condition": "stable_selection",
+                    })
+                    break
+                # Marginal churn is not worth another full round: the selection
+                # is effectively settled and another pass only burns calls.
+                marginal = max(1, int(len(round_pages) * 0.05))
+                if changed_count <= marginal:
+                    self.db.add_event(job_id, "review_stopped", {
+                        "round": round_number,
+                        "condition": "marginal_change",
+                        "changed_count": changed_count,
+                        "threshold": marginal,
+                    })
+                    break
             review_targets = (
                 list(pages)
                 if changed_count
@@ -1429,6 +1472,348 @@ class Pipeline:
         if subprocess.run(command, capture_output=True, timeout=120, check=False).returncode:
             raise RuntimeError("local frame resampling failed")
 
+    # ------------------------------------------------------------------
+    # Three-channel boundary detection (audio / semantics / vision)
+    # ------------------------------------------------------------------
+
+    def _chat_json(
+        self,
+        key: str,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int,
+        model: str = "deepseek/deepseek-v4-flash-vision-exp",
+    ) -> dict[str, Any]:
+        """One bounded JSON completion against the configured gateway."""
+        response = httpx.post(
+            f"{self.settings.openrouter_base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "model": model,
+                "messages": messages,
+                "response_format": {"type": "json_object"},
+                "temperature": 0,
+                "max_tokens": max_tokens,
+                "reasoning": {"effort": "none", "exclude": True},
+            },
+            timeout=120,
+        )
+        self._raise_for_openrouter_status(response)
+        text = self._message_text(response.json()["choices"][0]["message"]["content"])
+        return self._json_object(text)
+
+    def _silence_threshold_db(self, audio: Path) -> int:
+        """Derive the silence cutoff from this track's own loudness.
+
+        A fixed dB value either misses every pause in a quiet recording or
+        shreds continuous speech in a loud one, so measure first.
+        """
+        ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-nostats", "-i", str(audio),
+             "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=600, check=False,
+        )
+        match = re.search(r"mean_volume:\s*(-?[\d.]+)\s*dB", proc.stderr or "")
+        if not match:
+            return -32
+        mean = float(match.group(1))
+        if mean <= -90:
+            return -32
+        return int(max(-55, min(-25, round(mean - 18))))
+
+    def _silence_boundaries(self, audio: Path, duration_ms: int) -> list[int]:
+        """Return pause timestamps that mark natural paragraph breaks."""
+        ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+        noise_db = self._silence_threshold_db(audio)
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-nostats", "-i", str(audio),
+             "-af", f"silencedetect=noise={noise_db}dB:d=0.35", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=900, check=False,
+        )
+        found: list[int] = []
+        for match in re.finditer(r"silence_start:\s*(-?[\d.]+)", proc.stderr or ""):
+            value = float(match.group(1))
+            if value > 0:
+                found.append(int(value * 1000))
+        return sorted({item for item in found if 0 < item < duration_ms})
+
+    def _attach_transcript(
+        self, pages: list[dict[str, Any]], segments: list[tuple[int, int, str]]
+    ) -> None:
+        """Spread the single full-track transcript across the fused pages."""
+        for page in pages:
+            start = int(page["start_ms"])
+            end = int(page["end_ms"])
+            texts = [
+                text for seg_start, seg_end, text in segments
+                if seg_start < end and seg_end > start
+            ]
+            page["paragraphs"] = texts or ["本页没有可辨识的讲解。"]
+            page["audit"]["asr"] = {
+                "model": "qwen/qwen3-asr-1.7b",
+                "mode": "full_track",
+                "segment_count": len(texts),
+            }
+
+    def _full_transcript(
+        self,
+        audio: Path,
+        workspace: Path,
+        duration_ms: int,
+        key: str,
+        on_chunk_complete: Callable[[], None] | None = None,
+    ) -> list[tuple[int, int, str]]:
+        """Transcribe the whole track once, keeping a timestamp per chunk.
+
+        Doing this up front replaces per-page transcription, so the semantic
+        channel can influence segmentation instead of only labelling it later.
+        """
+        segments: list[tuple[int, int, str]] = []
+        windows = self._audio_chunk_windows(0, duration_ms)
+        for number, (start, end) in enumerate(windows, 1):
+            clip = workspace / f"asr-full-{number:04}.opus"
+            try:
+                self._audio_clip(audio, clip, start, end)
+                text, _audit = self._transcribe(clip, key)
+            finally:
+                try:
+                    clip.unlink()
+                except OSError:
+                    pass
+            cleaned = (text or "").strip()
+            if cleaned:
+                segments.append((start, end, cleaned))
+            if on_chunk_complete is not None:
+                on_chunk_complete()
+        return segments
+
+    def _semantic_boundaries(
+        self, segments: list[tuple[int, int, str]], key: str
+    ) -> list[int]:
+        """Ask the model where the speaker moves to a new self-contained topic."""
+        if not segments:
+            return []
+        lines: list[str] = []
+        used = 0
+        for start, _end, text in segments:
+            line = f"[{self._format_ms(start)}] {text}"
+            if used + len(line) > 24_000:
+                break
+            lines.append(line)
+            used += len(line)
+        if not lines:
+            return []
+        prompt = (
+            "Below is a timestamped transcript of a lecture video. Identify where the speaker "
+            "moves on to a new self-contained topic that deserves its own page in a handout. "
+            "Place a boundary only at a genuine topic shift, never at every sentence or filler "
+            "pause. Aim for roughly one boundary per 2 to 4 minutes of substantive content. "
+            "Do not invent timestamps: every ms value must come from the transcript timestamps. "
+            "Return JSON only as {\"boundaries\": [{\"ms\": 123456, \"title\": \"short topic\"}]}."
+            "\n\n" + "\n".join(lines)
+        )
+        try:
+            payload = self._chat_json(key, [{"role": "user", "content": prompt}], max_tokens=1536)
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            return []
+        raw = payload.get("boundaries")
+        if not isinstance(raw, list):
+            return []
+        found: list[int] = []
+        for item in raw:
+            value = item.get("ms") if isinstance(item, dict) else item
+            try:
+                ms = int(float(value))
+            except (TypeError, ValueError):
+                continue
+            if ms > 0:
+                found.append(ms)
+        return sorted(set(found))
+
+    def _adaptive_visual_boundaries(
+        self,
+        video: Path,
+        sensitivity: float,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> tuple[list[int], float]:
+        """Score frame change and pick peaks with a self-tuning threshold.
+
+        Returns the boundaries plus a peakiness ratio: a high ratio means the
+        video cuts hard (slide deck), a ratio near 1 means the picture barely
+        changes (talking head). The caller uses it to weight the channels.
+        """
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            return [], 1.0
+        cap = cv2.VideoCapture(str(video))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 4.0
+        frame_total = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
+        sample_stride = max(1, round(fps))
+        samples: list[tuple[int, Any, float]] = []
+        index = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if index % sample_stride == 0:
+                timestamp = int(index / fps * 1000)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                # Auto-mask the subtitle band; changing subtitles otherwise
+                # dominate every comparison in lecture videos.
+                visual_region = gray[: max(1, int(gray.shape[0] * 0.86)), :]
+                small = cv2.resize(visual_region, (128, 64))
+                sharpness = float(cv2.Laplacian(visual_region, cv2.CV_64F).var())
+                samples.append((timestamp, small, sharpness))
+            index += 1
+            if on_progress and (index % max(12, sample_stride * 3) == 0):
+                on_progress(min(index, frame_total), frame_total)
+        cap.release()
+        if on_progress:
+            on_progress(frame_total, frame_total)
+        if len(samples) < 3:
+            return [], 1.0
+
+        def visual_difference(left: Any, right: Any) -> float:
+            pixel = float(np.mean(cv2.absdiff(left, right))) / 255.0
+            left_edges = cv2.Canny(left, 60, 160)
+            right_edges = cv2.Canny(right, 60, 160)
+            edge = float(np.mean(left_edges != right_edges))
+            return pixel * 0.65 + edge * 0.35
+
+        scored = [
+            (samples[i - 1][0], samples[i - 1][0], visual_difference(samples[i - 1][1], samples[i][1]))
+            for i in range(1, len(samples))
+        ]
+        scores = np.array([item[2] for item in scored], dtype=float)
+        median = float(np.median(scores))
+        mad = float(np.median(np.abs(scores - median)))
+        spread = mad if mad > 1e-6 else (float(np.std(scores)) or 1e-6)
+        peak_ratio = float(np.percentile(scores, 95)) / median if median > 1e-6 else 1.0
+        # Robust statistics replace a fixed cutoff: a flat profile gets a low
+        # bar, a spiky profile a high one, on the same video and across videos.
+        k = 3.2 - 1.4 * min(1.0, max(0.0, sensitivity))
+        threshold = max(median + k * spread, median * 1.35)
+        peaks: list[tuple[int, int, float]] = []
+        for position, item in enumerate(scored):
+            score = item[2]
+            if score < threshold:
+                continue
+            neighborhood = scored[max(0, position - 2):position] + scored[position + 1:position + 3]
+            if any(score < neighbor[2] for neighbor in neighborhood):
+                continue
+            if peaks and item[1] - peaks[-1][1] < 2000:
+                if score > peaks[-1][2]:
+                    peaks[-1] = item
+                continue
+            peaks.append(item)
+        return sorted({item[1] for item in peaks}), peak_ratio
+
+    def _fuse_boundaries(
+        self,
+        visual: list[int],
+        audio: list[int],
+        semantic: list[int],
+        duration_ms: int,
+        peak_ratio: float,
+    ) -> list[int]:
+        """Merge the three channels, weighting them by how the video behaves."""
+        if duration_ms <= 0:
+            return []
+        try:
+            import numpy as np
+        except ImportError:
+            return []
+        # A deck that cuts hard should follow its visuals; a talking head barely
+        # changes on screen, so speech and semantics must lead instead.
+        cutting = peak_ratio >= 2.5
+        weights = {
+            "visual": 1.0 if cutting else 0.55,
+            "audio": 0.60 if cutting else 0.85,
+            "semantic": 0.70 if cutting else 1.00,
+        }
+        candidates: list[tuple[int, float, str]] = []
+        for name, values in (("visual", visual), ("audio", audio), ("semantic", semantic)):
+            for value in values:
+                if 0 < value < duration_ms:
+                    candidates.append((value, weights[name], name))
+        if not candidates:
+            return []
+        candidates.sort()
+        spans = [b - a for a, b in zip(semantic, semantic[1:])]
+        typical = float(np.median(spans)) if len(spans) >= 2 else duration_ms / 8.0
+        window = int(max(4000, min(20000, typical * 0.25)))
+        clusters: list[list[tuple[int, float, str]]] = []
+        for candidate in candidates:
+            if clusters and candidate[0] - clusters[-1][-1][0] <= window:
+                clusters[-1].append(candidate)
+            else:
+                clusters.append([candidate])
+        chosen = [max(cluster, key=lambda item: item[1])[0] for cluster in clusters]
+        # A segment has to be long enough to stand alone in the handout.
+        minimum = max(20000, duration_ms // 60)
+        kept: list[int] = []
+        for boundary in chosen:
+            if not kept or boundary - kept[-1] >= minimum:
+                kept.append(boundary)
+        return kept
+
+    def _build_pages_from_boundaries(
+        self,
+        video: Path,
+        boundaries: list[int],
+        duration_ms: int,
+        workspace: Path,
+        channels: dict[str, int],
+    ) -> list[dict[str, Any]]:
+        """Create one page per fused segment, taking the settled frame of each."""
+        try:
+            import cv2
+        except ImportError:
+            return self._fallback_pages(workspace, duration_ms)
+        edges = sorted({0, duration_ms} | {b for b in boundaries if 0 < b < duration_ms})
+        if len(edges) < 3:
+            return self._fallback_pages(workspace, duration_ms)
+        reader = cv2.VideoCapture(str(video))
+        pages: list[dict[str, Any]] = []
+        for start, end in zip(edges, edges[1:]):
+            if end - start < 500:
+                continue
+            # Take the frame just before the segment ends: the settled state.
+            reader.set(cv2.CAP_PROP_POS_MSEC, max(start, end - 800))
+            ok, frame = reader.read()
+            if not ok:
+                reader.set(cv2.CAP_PROP_POS_MSEC, start)
+                ok, frame = reader.read()
+            if not ok:
+                continue
+            page_number = len(pages) + 1
+            preview = workspace / f"page-{page_number:04}.jpg"
+            cv2.imwrite(str(preview), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            pages.append({
+                "page_number": page_number,
+                "start_ms": start,
+                "end_ms": end,
+                "keyframe_ms": max(start, end - 800),
+                "title": f"视频页 {page_number}",
+                "paragraphs": [],
+                "confidence": 0.84,
+                "preview_key": self.store.key(preview),
+                "audit": {
+                    "candidate_source": "three_channel_fusion",
+                    "channels": dict(channels),
+                    "dedup_basis": "semantic_and_audio_and_visual_boundaries",
+                    "boundary_confidence": 0.84,
+                    "final_state_confidence": 0.80,
+                },
+            })
+        reader.release()
+        if len(pages) < 2:
+            return self._fallback_pages(workspace, duration_ms)
+        return pages
+
     def _opencv_candidates(
         self,
         video: Path,
@@ -1561,31 +1946,57 @@ class Pipeline:
             region = image[: max(1, int(image.shape[0] * 0.86)), :]
             return cv2.resize(region, (128, 64))
 
+        # Measure this video's own repeat threshold rather than fixing one: a
+        # talking head sits near zero everywhere while a deck jumps hard, and a
+        # single constant mis-serves one of the two.
+        features: list[Any] = []
+        for page in pages:
+            try:
+                features.append(feature(page))
+            except ValueError:
+                features.append(None)
+        differences: list[float] = []
+        for position in range(1, len(features)):
+            left, right = features[position - 1], features[position]
+            if left is None or right is None:
+                continue
+            differences.append(
+                float(np.mean(cv2.absdiff(left, right))) / 255.0
+            )
+        if differences:
+            spread = np.array(differences, dtype=float)
+            repeat_cutoff = max(0.004, min(0.05, float(np.percentile(spread, 12))))
+        else:
+            repeat_cutoff = 0.018
+        spans = [int(page["end_ms"]) - int(page["start_ms"]) for page in pages]
+        # A fragment is only a "micro page" relative to how long this video's
+        # own segments are.
+        micro_cutoff = 2000
+        if len(spans) >= 3:
+            micro_cutoff = int(max(1500, min(6000, float(np.median(spans)) * 0.25)))
+
         index = 0
         while index < len(pages):
             page = pages[index]
             duration = int(page["end_ms"]) - int(page["start_ms"])
             duplicate_previous = False
             if index > 0:
-                try:
-                    difference = float(np.mean(cv2.absdiff(
-                        feature(pages[index - 1]), feature(page)
-                    ))) / 255.0
-                    duplicate_previous = difference < 0.018
-                except ValueError:
-                    duplicate_previous = False
-            if index > 0 and (duration < 2000 or duplicate_previous):
+                left, right = features[index - 1], features[index]
+                if left is not None and right is not None:
+                    difference = float(np.mean(cv2.absdiff(left, right))) / 255.0
+                    duplicate_previous = difference < repeat_cutoff
+            if index > 0 and (duration < micro_cutoff or duplicate_previous):
                 previous = pages[index - 1]
                 previous["end_ms"] = page["end_ms"]
                 previous["paragraphs"].extend(page["paragraphs"])
                 previous["audit"].setdefault("collapsed_pages", []).append({
-                    "reason": "micro_page" if duration < 2000 else "visual_duplicate",
+                    "reason": "micro_page" if duration < micro_cutoff else "visual_duplicate",
                     "start_ms": page["start_ms"],
                     "end_ms": page["end_ms"],
                 })
                 pages.pop(index)
                 continue
-            if index == 0 and duration < 2000 and len(pages) > 1:
+            if index == 0 and duration < micro_cutoff and len(pages) > 1:
                 following = pages[1]
                 following["start_ms"] = page["start_ms"]
                 following["paragraphs"] = page["paragraphs"] + following["paragraphs"]
